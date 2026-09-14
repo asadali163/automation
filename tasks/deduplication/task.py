@@ -5,7 +5,7 @@ from .ui import render
 TASK = Task(
     id="deduplication",
     title="Deduplication",
-    icon="🧹",
+    icon="",
     render=render,
     order=20,
 )

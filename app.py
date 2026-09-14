@@ -3,6 +3,7 @@
 Do NOT hardcode tasks here — drop a new package under `tasks/` (see
 `tasks/file_merger` as a template) and it shows up automatically as a tab.
 """
+
 import streamlit as st
 
 from config import OUTPUTS_DIR, UPLOADS_DIR
@@ -14,7 +15,7 @@ st.set_page_config(page_title="Automation Dashboard", page_icon="⚙️", layout
 cleanup_old_dirs(UPLOADS_DIR)
 cleanup_old_dirs(OUTPUTS_DIR)
 
-st.title("⚙️ Automation Dashboard")
+st.title("Automation Dashboard")
 
 tasks = discover_tasks()
 

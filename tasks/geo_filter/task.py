@@ -5,7 +5,7 @@ from .ui import render
 TASK = Task(
     id="geo_filter",
     title="Geo Boundary Filter",
-    icon="📍",
+    icon="",
     render=render,
     order=30,
 )
