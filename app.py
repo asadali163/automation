@@ -22,7 +22,7 @@ tasks = discover_tasks()
 if not tasks:
     st.info("No tasks registered yet. Add a module under `tasks/`.")
 else:
-    tabs = st.tabs([f"{t.icon} {t.title}" for t in tasks])
+    tabs = st.tabs([f"{t.icon} {t.title}".strip() if t.icon else t.title for t in tasks])
     for tab, task in zip(tabs, tasks):
         with tab:
             task.render()

@@ -17,9 +17,9 @@ def render() -> None:
     st.header("Merge Files")
     st.caption(
         "Upload a .zip file with (possibly nested) folders of CSV/Excel files. "
-        "Every matching file, at any depth, gets merged into one CSV — with a "
-        "`--- Source: ... ---` marker line before each file's rows so you can "
-        "trace where the data came from."
+        "Every matching file, at any depth, gets merged into one flat table — "
+        "with a `source_file` column on every row so you can trace where the "
+        "data came from without breaking Excel filters/pivots/sorting."
     )
 
     uploaded_zip = st.file_uploader("Upload a .zip file", type=["zip"], key="file_merger_zip")
@@ -84,21 +84,24 @@ def _merge_and_offer_download(session: dict) -> None:
         st.error("Nothing could be merged.")
         return
 
-    merged_text = logic.to_marker_text(combined_df)
+    merged_csv = combined_df.to_csv(index=False)
     output_name = f"merged_{Path(session['session_dir']).name}.csv"
     output_path = OUTPUTS_DIR / output_name
-    output_path.write_text(merged_text, encoding="utf-8")
+    output_path.write_text(merged_csv, encoding="utf-8")
 
     st.success(f"Merged {stats['files_merged']} file(s), {stats['total_rows']} total rows.")
+    with st.expander("Preview merged data", expanded=False):
+        st.dataframe(combined_df.head(20), use_container_width=True)
+
     st.download_button(
         "Download merged CSV",
-        data=merged_text,
+        data=merged_csv,
         file_name=output_name,
         mime="text/csv",
     )
 
     pipeline.publish(combined_df, produced_by="file_merger", task_title="Merge Files")
     st.caption(
-        "This merged table (with a `source_file` column added) is now available "
-        "to continue straight into the next tab — no re-upload needed."
+        "This merged table is now available to continue straight into the "
+        "next tab — no re-upload needed."
     )

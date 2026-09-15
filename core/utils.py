@@ -5,9 +5,14 @@ import uuid
 from pathlib import Path
 
 
+def short_id() -> str:
+    """A short, URL/filename-safe unique id (e.g. for output filenames)."""
+    return uuid.uuid4().hex[:8]
+
+
 def new_session_dir(parent: Path) -> Path:
     """Create and return a fresh, uniquely-named scratch folder under `parent`."""
-    session_dir = parent / uuid.uuid4().hex[:8]
+    session_dir = parent / short_id()
     session_dir.mkdir(parents=True, exist_ok=True)
     return session_dir
 
