@@ -29,11 +29,13 @@ Automation Project/
 │   ├── base.py                 # the Task contract every module implements
 │   ├── file_merger/             # Tab 1: zip upload -> merge into one file
 │   ├── deduplication/             # Tab 2: multi-pass dedup
-│   ├── geo_filter/                 # Tab 3: keep only rows inside a KML boundary
-│   └── csv_merger/                  # Tab 4: upload several CSV/Excel files directly -> merge
-│       ├── task.py                   # declares the TASK object (title/icon/order/render)
-│       ├── ui.py                      # Streamlit widgets for this tab
-│       └── logic.py                    # pure Python logic (unit-testable, no Streamlit)
+│   ├── geo_filter/                  # Tab 3: keep only rows inside a KML boundary
+│   ├── csv_merger/                    # Tab 4: upload several CSV/Excel files directly -> merge
+│   ├── geocoding/                       # disabled — see note below, not currently a tab
+│   └── csv_to_excel/                      # Tab 5: upload a .csv -> download as .xlsx
+│       ├── task.py                          # declares the TASK object (title/icon/order/render)
+│       ├── ui.py                             # Streamlit widgets for this tab
+│       └── logic.py                           # pure Python logic (unit-testable, no Streamlit)
 ├── data/
 │   ├── uploads/               # extracted uploads, per-session subfolders (gitignored)
 │   └── outputs/                 # generated files offered for download (gitignored)
@@ -70,22 +72,27 @@ Merge CSVs, by design, never continues from a previous tab).
    If it produces a table others might want to continue from, call
    `core.pipeline.publish(...)` at the end.
 3. In `task.py`, set `id`, `title`, `icon`, `order` (controls tab position —
-   ascending, ties break alphabetically; existing tasks use 10/20/30/40 —
+   ascending, ties break alphabetically; existing tasks use 10/20/30/40/60 —
    leave gaps so you can slot new ones in between), and point `render` at
    your `ui.render` function.
 4. Make sure `tasks/my_new_task/__init__.py` does `from .task import TASK`.
 5. Done — `app.py` picks it up automatically on next run, no other file
    needs to change. Add `tests/test_my_new_task_logic.py` alongside it.
 
+**Disabling a tab without deleting it:** comment out the `from .task import
+TASK` line in that task's `__init__.py` (see `tasks/geocoding/__init__.py`
+for the pattern). The registry only turns a `tasks/*` subfolder into a tab
+if it exposes a `TASK` object, so this hides it with zero risk to the
+task's actual code — uncomment to bring it back.
+
 ## Tab 1: Merge Files
 
 Upload a `.zip` containing (arbitrarily nested) folders of `.csv` /
 `.xlsx` / `.xls` files. Every matching file, at any depth, is read into a
-table and combined into one, tagged with a `source_file` column. Download
-gets the human-readable version — one block per source file, each preceded
-by a `--- Source: relative/path/to/file.csv ---` marker line — while the
-tagged table itself is offered to the next tab (e.g. Deduplication) so you
-don't have to re-upload.
+table and combined into one flat table, tagged with a `source_file` column
+on every row (so you can trace where the data came from without breaking
+Excel filters/pivots/sorting the way an inline marker row would). Offered
+to the next tab (e.g. Deduplication) so you don't have to re-upload.
 
 ## Tab 2: Deduplication
 
@@ -110,9 +117,53 @@ more `.csv`/`.xlsx`/`.xls` files directly. Shows a file-x-column presence
 matrix up front so mismatched schemas are visible at a glance, then lets
 you remove columns per file (handy for trimming an extra column out of one
 file so it lines up with another) before merging — combined the same way
-as Merge Files (source-tagged table + marker-annotated download). Always
+as Merge Files (one flat table, `source_file` column on every row). Always
 starts from a fresh upload; it does not offer to continue from a previous
 tab.
+
+## Tab 5: CSV to Excel
+
+Upload a `.csv` file and download it back as an `.xlsx` file — pure format
+conversion, no other changes to the data.
+
+## Geocoding (currently disabled)
+
+Not shown as a tab right now — commented out in `tasks/geocoding/__init__.py`
+(see "Disabling a tab without deleting it" above), code fully intact.
+
+When enabled: continue from a previous tab or upload a CSV/Excel file, then
+pick 1 or 2 columns that hold the address (e.g. "street" + "city"). Adds
+`latitude`, `longitude`, `geocode_status`, `geocode_source` and
+`geocode_query` columns.
+
+Two providers are tried per address, in order:
+
+1. **Nominatim** (OpenStreetMap) — free, no key, rate-limited to ~1
+   lookup/second. Rather than querying the address once, it walks a ladder
+   of progressively simpler variants until one resolves:
+
+   | # | variant | example |
+   |---|---------|---------|
+   | 1 | raw address | `1071 Budapest 07. ker. Rottenbiller utca 49.` |
+   | 2 | district marker stripped | `1071 Budapest Rottenbiller utca 49.` |
+   | 3 | house-number range/suffix simplified | `Zsókavár utca 43-47 fszt` → `Zsókavár utca 43.` |
+   | 4 | house number dropped, street kept | `1071 Budapest Rottenbiller utca` |
+
+   This ladder is what lifts the hit rate on messy official-register
+   addresses (2% → 94% on the Budapest list it was derived from).
+2. **Geoapify** — only for addresses Nominatim couldn't resolve, so it
+   burns very few of the free tier's **3,000 requests/day**.
+
+`geocode_source` records which service resolved each row and
+`geocode_query` which variant worked, so the outcome is always traceable.
+An optional **country code** field (e.g. `hu`, `nl`) restricts Nominatim
+to one country, which improves accuracy on single-country files.
+
+**API key setup:** the Geoapify fallback needs a `GEOAPIFY_API_KEY`. Copy
+`.streamlit/secrets.toml.example` to `.streamlit/secrets.toml` and fill in
+your key (that file is gitignored — it never gets committed), or paste one
+into the tab's password field for the session. Without a key the tab still
+runs Nominatim-only; unresolved rows just come back as `not_found`.
 
 ## Tests
 
