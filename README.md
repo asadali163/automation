@@ -116,6 +116,11 @@ plottable shop colored green/red by status) and as a table. Three separate
 downloads: the full processed table (all rows + `boundary_status`), inbound
 only, and outbound only.
 
+Pick which columns to show, then **click a shop on the map** for a details
+panel below it (hover gives a quick preview tooltip first). Uses Streamlit's
+native `st.pydeck_chart(..., on_select="rerun")` selection API — no extra
+dependency.
+
 ## Tab 4: Merge CSVs
 
 Same idea as Merge Files, but for when you don't have a zip — upload two or

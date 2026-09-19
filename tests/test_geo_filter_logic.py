@@ -121,3 +121,13 @@ def test_compute_view_state_centers_on_boundary(tmp_path):
     assert lat == pytest.approx(5, abs=0.01)
     assert lon == pytest.approx(5, abs=0.01)
     assert 2 <= zoom <= 16
+
+
+def test_build_detail_fields_uses_safe_keys_and_keeps_original_as_label():
+    fields = logic.build_detail_fields(["Shop Name", "License #", "City"])
+
+    assert fields == [("field0", "Shop Name"), ("field1", "License #"), ("field2", "City")]
+
+
+def test_build_detail_fields_empty_input():
+    assert logic.build_detail_fields([]) == []

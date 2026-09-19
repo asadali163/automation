@@ -12,6 +12,9 @@ from . import logic
 
 _LAT_HINTS = ("lat",)
 _LON_HINTS = ("lon", "lng")
+_DETAIL_HINTS = ("name", "shop", "address", "license")
+
+_SHOPS_LAYER_ID = "shops"
 
 
 def render() -> None:
@@ -20,7 +23,8 @@ def render() -> None:
         "Continue from a previous tab, or upload a CSV/Excel file, plus a "
         ".kml boundary file. Pick which columns hold latitude and "
         "longitude — every row is shown on a map and labeled **inbound** "
-        "(inside the boundary) or **outbound** (outside it)."
+        "(inside the boundary) or **outbound** (outside it). Click a shop "
+        "on the map to see its details."
     )
 
     df, source_id = pick_dataframe_source("geo_filter")
@@ -51,11 +55,18 @@ def render() -> None:
             key=f"geo_lon_col_{source_id}",
         )
 
+    detail_columns = st.multiselect(
+        "Columns to show when you click a shop on the map",
+        options=[c for c in columns if c not in (lat_col, lon_col)],
+        default=_guess_detail_defaults(columns, exclude=(lat_col, lon_col)),
+        key=f"geo_detail_cols_{source_id}",
+    )
+
     kml_file = st.file_uploader("Upload boundary (.kml)", type=["kml"], key="geo_kml_upload")
     if kml_file is None:
         return
 
-    _process(df, lat_col, lon_col, kml_file)
+    _process(df, lat_col, lon_col, detail_columns, kml_file, source_id)
 
 
 def _guess_column(columns, hints):
@@ -66,7 +77,18 @@ def _guess_column(columns, hints):
     return None
 
 
-def _process(df: pd.DataFrame, lat_col: str, lon_col: str, kml_file) -> None:
+def _guess_detail_defaults(columns, exclude, limit=3):
+    excluded = set(exclude)
+    hinted = [c for c in columns if c not in excluded and any(h in str(c).lower() for h in _DETAIL_HINTS)]
+    if hinted:
+        return hinted[:limit]
+    remaining = [c for c in columns if c not in excluded]
+    return remaining[: min(2, len(remaining))]
+
+
+def _process(
+    df: pd.DataFrame, lat_col: str, lon_col: str, detail_columns: list, kml_file, source_id: str
+) -> None:
     session_dir = new_session_dir(UPLOADS_DIR)
     kml_path = session_dir / "boundary.kml"
     kml_path.write_bytes(kml_file.getvalue())
@@ -97,7 +119,7 @@ def _process(df: pd.DataFrame, lat_col: str, lon_col: str, kml_file) -> None:
         f"out of {stats['total_rows']:,} total rows."
     )
 
-    _render_map(processed, lat_col, lon_col, boundary)
+    _render_map(processed, lat_col, lon_col, detail_columns, boundary, source_id)
 
     with st.expander("Preview processed data", expanded=False):
         st.dataframe(processed.head(20), use_container_width=True)
@@ -138,7 +160,9 @@ def _process(df: pd.DataFrame, lat_col: str, lon_col: str, kml_file) -> None:
     )
 
 
-def _render_map(processed: pd.DataFrame, lat_col: str, lon_col: str, boundary) -> None:
+def _render_map(
+    processed: pd.DataFrame, lat_col: str, lon_col: str, detail_columns: list, boundary, source_id: str
+) -> None:
     lat = pd.to_numeric(processed[lat_col], errors="coerce")
     lon = pd.to_numeric(processed[lon_col], errors="coerce")
     plottable = lat.notna() & lon.notna()
@@ -147,6 +171,8 @@ def _render_map(processed: pd.DataFrame, lat_col: str, lon_col: str, boundary) -
         st.info("No rows have plottable coordinates — map skipped.")
         return
 
+    fields = logic.build_detail_fields(detail_columns)
+
     map_df = pd.DataFrame(
         {
             "lat": lat[plottable],
@@ -154,6 +180,8 @@ def _render_map(processed: pd.DataFrame, lat_col: str, lon_col: str, boundary) -
             "status": processed.loc[plottable, "boundary_status"],
         }
     )
+    for key, col in fields:
+        map_df[key] = processed.loc[plottable, col].astype(str)
     map_df["color"] = map_df["status"].map(logic.STATUS_COLORS)
 
     center_lat, center_lon, zoom = logic.compute_view_state(boundary)
@@ -169,20 +197,50 @@ def _render_map(processed: pd.DataFrame, lat_col: str, lon_col: str, boundary) -
     )
     points_layer = pdk.Layer(
         "ScatterplotLayer",
+        id=_SHOPS_LAYER_ID,
         data=map_df,
         get_position="[lon, lat]",
         get_fill_color="color",
         get_radius=40,
-        radius_min_pixels=3,
-        radius_max_pixels=15,
+        radius_min_pixels=4,
+        radius_max_pixels=16,
         pickable=True,
+        auto_highlight=True,
     )
 
-    st.pydeck_chart(
+    tooltip_html = "<b>Status:</b> {status}" + "".join(f"<br/><b>{label}:</b> {{{key}}}" for key, label in fields)
+
+    event = st.pydeck_chart(
         pdk.Deck(
             layers=[boundary_layer, points_layer],
             initial_view_state=pdk.ViewState(latitude=center_lat, longitude=center_lon, zoom=zoom),
-            tooltip={"text": "{status}"},
-        )
+            tooltip={"html": tooltip_html, "style": {"backgroundColor": "white", "color": "black"}},
+        ),
+        on_select="rerun",
+        selection_mode="single-object",
+        key=f"geo_map_{source_id}",
     )
-    st.caption("🟢 green = inbound (inside boundary)  •  🔴 red = outbound (outside boundary)")
+    st.caption("🟢 green = inbound  •  🔴 red = outbound  •  hover for a quick preview, click for full details")
+
+    _render_selected_details(event, fields, lat_col, lon_col)
+
+
+def _render_selected_details(event, fields, lat_col: str, lon_col: str) -> None:
+    selected = []
+    if event and event.selection:
+        selected = event.selection.objects.get(_SHOPS_LAYER_ID, [])
+
+    if not selected:
+        st.caption("No shop selected — click one on the map above.")
+        return
+
+    shop = selected[0]
+    status = shop.get("status")
+    rows = [("Status", "Inbound ✅" if status == logic.STATUS_INBOUND else "Outbound ❌")]
+    for key, label in fields:
+        rows.append((label, shop.get(key, "")))
+    rows.append((lat_col, shop.get("lat", "")))
+    rows.append((lon_col, shop.get("lon", "")))
+
+    st.markdown("**Selected shop**")
+    st.table(pd.DataFrame(rows, columns=["Field", "Value"]).set_index("Field"))

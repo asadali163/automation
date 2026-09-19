@@ -125,3 +125,15 @@ def compute_view_state(boundary) -> Tuple[float, float, int]:
     span = max(max_lon - min_lon, max_lat - min_lat, 1e-6)
     zoom = max(2, min(16, round(8 - math.log2(span))))
     return centroid.y, centroid.x, zoom
+
+
+def build_detail_fields(display_columns: List[str]) -> List[Tuple[str, str]]:
+    """Map each display column to a template-safe key ("field0", "field1",
+    ...), paired with its original name as the human-readable label.
+
+    Used for the map's hover tooltip and click-details panel: pydeck/deck.gl
+    templates substitute `{key}` directly against a data point's properties,
+    so real column names (which may contain spaces or other characters) are
+    kept only as labels, never as the template key itself.
+    """
+    return [(f"field{i}", str(col)) for i, col in enumerate(display_columns)]
