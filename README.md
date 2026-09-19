@@ -106,9 +106,15 @@ before/after row-count report and offers the result to the next tab.
 
 Continue from a previous tab or upload a CSV/Excel file, plus a `.kml`
 boundary file. Pick which columns hold latitude/longitude (not assumed to
-be named "lat"/"lon" — auto-guessed as a default, but always overridable),
-and only the rows whose point falls inside the KML boundary are kept.
+be named "lat"/"lon" — auto-guessed as a default, but always overridable).
 Handles multiple/nested `<Polygon>` shapes and holes (`innerBoundaryIs`).
+
+Every row gets a `boundary_status` of `inbound` (inside the boundary) or
+`outbound` (outside it, or its coordinates were missing/invalid) — shown
+both as a map (`pydeck`, ships with Streamlit — boundary polygon plus every
+plottable shop colored green/red by status) and as a table. Three separate
+downloads: the full processed table (all rows + `boundary_status`), inbound
+only, and outbound only.
 
 ## Tab 4: Merge CSVs
 

@@ -54,7 +54,7 @@ def test_parse_kml_boundary_raises_when_no_polygon(tmp_path):
         logic.parse_kml_boundary(path)
 
 
-def test_filter_points_in_boundary_splits_and_reports_stats(tmp_path):
+def test_filter_points_in_boundary_labels_rows_and_reports_stats(tmp_path):
     boundary = logic.parse_kml_boundary(_write_kml(tmp_path, _SQUARE_KML))
 
     df = pd.DataFrame(
@@ -65,14 +65,59 @@ def test_filter_points_in_boundary_splits_and_reports_stats(tmp_path):
         }
     )
 
-    inside_df, outside_df, stats = logic.filter_points_in_boundary(
+    processed, stats = logic.filter_points_in_boundary(
         df, lat_col="Latitude", lon_col="Longitude", boundary=boundary
     )
 
     assert stats["total_rows"] == 4
     assert stats["invalid_coords"] == 1
-    assert stats["inside"] == 2   # Inside Shop + Edge Shop
-    assert stats["outside"] == 2   # Outside Shop + Bad Coords Shop
+    assert stats["inbound"] == 2   # Inside Shop + Edge Shop
+    assert stats["outbound"] == 2   # Outside Shop + Bad Coords Shop
 
-    assert sorted(inside_df["Shop"]) == ["Edge Shop", "Inside Shop"]
-    assert sorted(outside_df["Shop"]) == ["Bad Coords Shop", "Outside Shop"]
+    # processed keeps every original row, in order, plus the new column
+    assert list(processed["Shop"]) == ["Inside Shop", "Outside Shop", "Edge Shop", "Bad Coords Shop"]
+    assert list(processed["boundary_status"]) == [
+        logic.STATUS_INBOUND,
+        logic.STATUS_OUTBOUND,
+        logic.STATUS_INBOUND,
+        logic.STATUS_OUTBOUND,
+    ]
+
+
+def test_split_by_status_separates_inbound_and_outbound(tmp_path):
+    boundary = logic.parse_kml_boundary(_write_kml(tmp_path, _SQUARE_KML))
+    df = pd.DataFrame(
+        {
+            "Shop": ["Inside Shop", "Outside Shop", "Bad Coords Shop"],
+            "Latitude": ["5", "50", "not-a-number"],
+            "Longitude": ["5", "50", "5"],
+        }
+    )
+    processed, _ = logic.filter_points_in_boundary(df, "Latitude", "Longitude", boundary)
+
+    inbound_df, outbound_df = logic.split_by_status(processed)
+
+    assert list(inbound_df["Shop"]) == ["Inside Shop"]
+    assert list(outbound_df["Shop"]) == ["Outside Shop", "Bad Coords Shop"]
+    assert (inbound_df["boundary_status"] == logic.STATUS_INBOUND).all()
+    assert (outbound_df["boundary_status"] == logic.STATUS_OUTBOUND).all()
+
+
+def test_boundary_to_geojson_feature_wraps_geometry(tmp_path):
+    boundary = logic.parse_kml_boundary(_write_kml(tmp_path, _SQUARE_KML))
+
+    feature = logic.boundary_to_geojson_feature(boundary)
+
+    assert feature["type"] == "Feature"
+    assert feature["geometry"]["type"] in ("Polygon", "MultiPolygon")
+
+
+def test_compute_view_state_centers_on_boundary(tmp_path):
+    boundary = logic.parse_kml_boundary(_write_kml(tmp_path, _SQUARE_KML))
+
+    lat, lon, zoom = logic.compute_view_state(boundary)
+
+    # the 10x10 square spans lon/lat [0,10] -> centroid at (5, 5)
+    assert lat == pytest.approx(5, abs=0.01)
+    assert lon == pytest.approx(5, abs=0.01)
+    assert 2 <= zoom <= 16
