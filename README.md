@@ -31,8 +31,8 @@ Automation Project/
 │   ├── deduplication/             # Tab 2: multi-pass dedup
 │   ├── geo_filter/                  # Tab 3: keep only rows inside a KML boundary
 │   ├── csv_merger/                    # Tab 4: upload several CSV/Excel files directly -> merge
-│   ├── geocoding/                       # disabled — see note below, not currently a tab
-│   └── csv_to_excel/                      # Tab 5: upload a .csv -> download as .xlsx
+│   ├── geocoding/                       # Tab 5: address <-> coordinates, both directions
+│   └── csv_to_excel/                      # Tab 6: upload a .csv -> download as .xlsx
 │       ├── task.py                          # declares the TASK object (title/icon/order/render)
 │       ├── ui.py                             # Streamlit widgets for this tab
 │       └── logic.py                           # pure Python logic (unit-testable, no Streamlit)
@@ -72,7 +72,7 @@ Merge CSVs, by design, never continues from a previous tab).
    If it produces a table others might want to continue from, call
    `core.pipeline.publish(...)` at the end.
 3. In `task.py`, set `id`, `title`, `icon`, `order` (controls tab position —
-   ascending, ties break alphabetically; existing tasks use 10/20/30/40/60 —
+   ascending, ties break alphabetically; existing tasks use 10/20/30/40/50/60 —
    leave gaps so you can slot new ones in between), and point `render` at
    your `ui.render` function.
 4. Make sure `tasks/my_new_task/__init__.py` does `from .task import TASK`.
@@ -80,10 +80,10 @@ Merge CSVs, by design, never continues from a previous tab).
    needs to change. Add `tests/test_my_new_task_logic.py` alongside it.
 
 **Disabling a tab without deleting it:** comment out the `from .task import
-TASK` line in that task's `__init__.py` (see `tasks/geocoding/__init__.py`
-for the pattern). The registry only turns a `tasks/*` subfolder into a tab
-if it exposes a `TASK` object, so this hides it with zero risk to the
-task's actual code — uncomment to bring it back.
+TASK` line in that task's `__init__.py` (and the `__all__` line below it).
+The registry only turns a `tasks/*` subfolder into a tab if it exposes a
+`TASK` object, so this hides it with zero risk to the task's actual code —
+uncomment both lines to bring it back.
 
 ## Tab 1: Merge Files
 
@@ -132,22 +132,14 @@ as Merge Files (one flat table, `source_file` column on every row). Always
 starts from a fresh upload; it does not offer to continue from a previous
 tab.
 
-## Tab 5: CSV to Excel
+## Tab 5: Geocoding
 
-Upload a `.csv` file and download it back as an `.xlsx` file — pure format
-conversion, no other changes to the data.
+Continue from a previous tab or upload a CSV/Excel file. A **Direction**
+toggle switches between the two modes, each trying two providers in order:
 
-## Geocoding (currently disabled)
-
-Not shown as a tab right now — commented out in `tasks/geocoding/__init__.py`
-(see "Disabling a tab without deleting it" above), code fully intact.
-
-When enabled: continue from a previous tab or upload a CSV/Excel file, then
-pick 1 or 2 columns that hold the address (e.g. "street" + "city"). Adds
-`latitude`, `longitude`, `geocode_status`, `geocode_source` and
-`geocode_query` columns.
-
-Two providers are tried per address, in order:
+**Address → Coordinates:** pick 1 or 2 columns that hold the address (e.g.
+"street" + "city"). Adds `latitude`, `longitude`, `geocode_status`,
+`geocode_source` and `geocode_query` columns.
 
 1. **Nominatim** (OpenStreetMap) — free, no key, rate-limited to ~1
    lookup/second. Rather than querying the address once, it walks a ladder
@@ -170,11 +162,24 @@ Two providers are tried per address, in order:
 An optional **country code** field (e.g. `hu`, `nl`) restricts Nominatim
 to one country, which improves accuracy on single-country files.
 
-**API key setup:** the Geoapify fallback needs a `GEOAPIFY_API_KEY`. Copy
-`.streamlit/secrets.toml.example` to `.streamlit/secrets.toml` and fill in
-your key (that file is gitignored — it never gets committed), or paste one
-into the tab's password field for the session. Without a key the tab still
-runs Nominatim-only; unresolved rows just come back as `not_found`.
+**Coordinates → Address:** pick the latitude and longitude columns (same
+Nominatim-first-then-Geoapify chain, reverse lookup). Adds
+`reverse_address`, `reverse_geocode_status` and `reverse_geocode_source` —
+named `reverse_address`, not `address`, so it never overwrites an existing
+address column already in your data. Repeated coordinate pairs (rounded to
+6 decimal places) are only looked up once.
+
+**API key setup:** the Geoapify fallback (either direction) needs a
+`GEOAPIFY_API_KEY`. Copy `.streamlit/secrets.toml.example` to
+`.streamlit/secrets.toml` and fill in your key (that file is gitignored —
+it never gets committed), or paste one into the tab's password field for
+the session. Without a key the tab still runs Nominatim-only; unresolved
+rows just come back as `not_found`.
+
+## Tab 6: CSV to Excel
+
+Upload a `.csv` file and download it back as an `.xlsx` file — pure format
+conversion, no other changes to the data.
 
 ## Tests
 

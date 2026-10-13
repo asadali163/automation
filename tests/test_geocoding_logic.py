@@ -251,3 +251,219 @@ def test_geoapify_fn_returns_none_when_no_results(monkeypatch):
         logic.requests, "get", lambda url, params, timeout: _FakeResponse({"results": []})
     )
     assert logic.build_geoapify_fn(api_key="k")("nowhere at all") is None
+
+
+# --- reverse geocoding (coordinates -> address) -----------------------------------
+
+
+def _reverse_hit(address: str, provider: str) -> logic.ReverseHit:
+    return logic.ReverseHit(address=address, provider=provider)
+
+
+def test_nominatim_reverse_fn_parses_display_name(monkeypatch):
+    captured = {}
+
+    def fake_get(url, params, headers, timeout):
+        captured.update(params)
+        assert url == logic.NOMINATIM_REVERSE_URL
+        return _FakeResponse({"display_name": "10 Downing Street, London, UK"})
+
+    monkeypatch.setattr(logic.requests, "get", fake_get)
+    monkeypatch.setattr(logic.time, "sleep", lambda s: None)
+
+    hit = logic.build_nominatim_reverse_fn()(51.5034, -0.1276)
+
+    assert hit == _reverse_hit("10 Downing Street, London, UK", logic.PROVIDER_NOMINATIM)
+    assert captured == {"lat": 51.5034, "lon": -0.1276, "format": "json"}
+
+
+def test_nominatim_reverse_fn_returns_none_when_no_display_name(monkeypatch):
+    monkeypatch.setattr(logic.requests, "get", lambda url, params, headers, timeout: _FakeResponse({}))
+    monkeypatch.setattr(logic.time, "sleep", lambda s: None)
+
+    assert logic.build_nominatim_reverse_fn()(0.0, 0.0) is None
+
+
+def test_geoapify_reverse_fn_parses_formatted_address(monkeypatch):
+    captured = {}
+
+    def fake_get(url, params, timeout):
+        captured.update(params)
+        assert url == logic.GEOAPIFY_REVERSE_URL
+        return _FakeResponse({"results": [{"formatted": "Eiffel Tower, Paris, France"}]})
+
+    monkeypatch.setattr(logic.requests, "get", fake_get)
+
+    hit = logic.build_geoapify_reverse_fn(api_key="test-key")(48.8584, 2.2945)
+
+    assert hit == _reverse_hit("Eiffel Tower, Paris, France", logic.PROVIDER_GEOAPIFY)
+    assert captured == {"lat": 48.8584, "lon": 2.2945, "apiKey": "test-key", "format": "json"}
+
+
+def test_geoapify_reverse_fn_returns_none_when_no_results(monkeypatch):
+    monkeypatch.setattr(
+        logic.requests, "get", lambda url, params, timeout: _FakeResponse({"results": []})
+    )
+    assert logic.build_geoapify_reverse_fn(api_key="k")(0.0, 0.0) is None
+
+
+def test_chain_providers_works_for_reverse_signature_too():
+    def primary(lat, lon):
+        return None
+
+    def fallback(lat, lon):
+        return _reverse_hit("fallback address", logic.PROVIDER_GEOAPIFY)
+
+    hit = logic.chain_providers([primary, fallback])(1.0, 2.0)
+
+    assert hit == _reverse_hit("fallback address", logic.PROVIDER_GEOAPIFY)
+
+
+def test_count_unique_coords_dedupes_and_ignores_invalid():
+    df = pd.DataFrame(
+        {
+            "lat": ["1.0", "1.0000001", "2.0", "not-a-number"],
+            "lon": ["3.0", "3.0000001", "4.0", "5.0"],
+        }
+    )
+    # the first two rows round to the same (1.0, 3.0) pair at 6 decimals
+    assert logic.count_unique_coords(df, "lat", "lon") == 2
+
+
+def test_reverse_geocode_dataframe_adds_columns_and_caches_repeats():
+    df = pd.DataFrame(
+        {
+            "lat": ["51.5034", "51.5034", "0.0", "bad"],
+            "lon": ["-0.1276", "-0.1276", "0.0", "5.0"],
+        }
+    )
+    calls: List[tuple] = []
+
+    def reverse_fn(lat: float, lon: float) -> Optional[logic.ReverseHit]:
+        calls.append((lat, lon))
+        if (lat, lon) == (51.5034, -0.1276):
+            return _reverse_hit("10 Downing Street", logic.PROVIDER_NOMINATIM)
+        return None
+
+    result = logic.reverse_geocode_dataframe(df, "lat", "lon", reverse_fn)
+
+    assert list(result["reverse_address"]) == ["10 Downing Street", "10 Downing Street", "", ""]
+    assert list(result["reverse_geocode_status"]) == ["ok", "ok", "not_found", "invalid_coords"]
+    assert list(result["reverse_geocode_source"]) == [
+        logic.PROVIDER_NOMINATIM,
+        logic.PROVIDER_NOMINATIM,
+        "",
+        "",
+    ]
+    assert calls.count((51.5034, -0.1276)) == 1  # second occurrence served from cache
+
+    stats = logic.summarise_reverse(result)
+    assert stats == {
+        "total_rows": 4,
+        "already_had_address": 0,
+        "geocoded": 2,
+        "not_found": 1,
+        "invalid_coords": 1,
+        "by_provider": {logic.PROVIDER_NOMINATIM: 2},
+    }
+
+
+def test_reverse_geocode_dataframe_calls_progress_callback_for_every_row():
+    df = pd.DataFrame({"lat": ["1", "2"], "lon": ["1", "2"]})
+    progress_calls = []
+
+    logic.reverse_geocode_dataframe(
+        df,
+        "lat",
+        "lon",
+        reverse_fn=lambda lat, lon: None,
+        progress_callback=lambda done, total: progress_calls.append((done, total)),
+    )
+
+    assert progress_calls == [(1, 2), (2, 2)]
+
+
+def test_reverse_geocode_dataframe_does_not_overwrite_existing_address_column():
+    df = pd.DataFrame({"address": ["Original Address"], "lat": ["1.0"], "lon": ["2.0"]})
+
+    result = logic.reverse_geocode_dataframe(df, "lat", "lon", reverse_fn=lambda lat, lon: None)
+
+    assert result["address"].iloc[0] == "Original Address"
+    assert "reverse_address" in result.columns
+
+
+def test_missing_value_mask_catches_nan_blank_whitespace_and_literal_nan_string():
+    series = pd.Series([None, "", "   ", "nan", "NaN", "Real Address"])
+    assert list(logic.missing_value_mask(series)) == [True, True, True, True, True, False]
+
+
+def test_reverse_geocode_dataframe_with_address_col_only_fills_blanks(monkeypatch):
+    # 1000-row-style scenario, scaled down: most rows already have an
+    # address, only a few are blank.
+    df = pd.DataFrame(
+        {
+            "Address": ["123 Existing St", "", "456 Existing Ave", None, "   "],
+            "lat": ["1.0", "2.0", "3.0", "4.0", "5.0"],
+            "lon": ["1.0", "2.0", "3.0", "4.0", "5.0"],
+        }
+    )
+    calls: List[tuple] = []
+
+    def reverse_fn(lat, lon):
+        calls.append((lat, lon))
+        return _reverse_hit(f"Resolved {lat},{lon}", logic.PROVIDER_NOMINATIM)
+
+    result = logic.reverse_geocode_dataframe(df, "lat", "lon", reverse_fn, address_col="Address")
+
+    # only the 3 blank rows ever reach the geocoder
+    assert len(calls) == 3
+    assert set(calls) == {(2.0, 2.0), (4.0, 4.0), (5.0, 5.0)}
+
+    # untouched rows keep their exact original value, in the SAME column
+    assert list(result["Address"]) == [
+        "123 Existing St",
+        "Resolved 2.0,2.0",
+        "456 Existing Ave",
+        "Resolved 4.0,4.0",
+        "Resolved 5.0,5.0",
+    ]
+    assert "reverse_address" not in result.columns  # filled in place, no extra column
+    assert list(result["reverse_geocode_status"]) == ["existing", "ok", "existing", "ok", "ok"]
+
+
+def test_reverse_geocode_dataframe_address_col_not_present_falls_back_to_new_column():
+    df = pd.DataFrame({"lat": ["1.0"], "lon": ["2.0"]})
+
+    result = logic.reverse_geocode_dataframe(
+        df, "lat", "lon", reverse_fn=lambda lat, lon: _reverse_hit("X", logic.PROVIDER_NOMINATIM),
+        address_col="Address",  # doesn't exist in df
+    )
+
+    assert "reverse_address" in result.columns
+    assert result["reverse_address"].iloc[0] == "X"
+
+
+def test_count_unique_coords_excludes_rows_that_already_have_an_address():
+    df = pd.DataFrame(
+        {
+            "Address": ["Known", "", "Known", ""],
+            "lat": ["1.0", "2.0", "1.0", "2.0"],
+            "lon": ["1.0", "2.0", "1.0", "2.0"],
+        }
+    )
+    # without address_col: all 2 distinct pairs count
+    assert logic.count_unique_coords(df, "lat", "lon") == 2
+    # with address_col: only the blank rows' pair (2.0, 2.0) counts
+    assert logic.count_unique_coords(df, "lat", "lon", address_col="Address") == 1
+
+
+def test_reverse_geocode_dataframe_skips_api_entirely_when_nothing_is_blank():
+    df = pd.DataFrame({"Address": ["A", "B"], "lat": ["1.0", "2.0"], "lon": ["1.0", "2.0"]})
+
+    def reverse_fn(lat, lon):
+        raise AssertionError("should never be called when nothing is blank")
+
+    result = logic.reverse_geocode_dataframe(df, "lat", "lon", reverse_fn, address_col="Address")
+
+    assert list(result["Address"]) == ["A", "B"]
+    assert list(result["reverse_geocode_status"]) == ["existing", "existing"]
