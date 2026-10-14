@@ -1,9 +1,11 @@
 """Streamlit UI for the Geocoding task."""
+from pathlib import Path
 from typing import List, Optional
 
 import pandas as pd
 import streamlit as st
 
+from config import OUTPUTS_DIR
 from core import pipeline
 from core.ui_helpers import pick_dataframe_source
 from core.utils import short_id
@@ -12,7 +14,7 @@ from . import logic
 
 _LAT_HINTS = ("lat",)
 _LON_HINTS = ("lon", "lng")
-_ADDRESS_HINTS = ("address",)
+_ADDRESS_HINTS = ("address", "addr", "cím")
 
 _MODE_FORWARD = "Address → Coordinates"
 _MODE_REVERSE = "Coordinates → Address"
@@ -24,7 +26,10 @@ def render() -> None:
         "Continue from a previous tab, or upload a CSV/Excel file. Two "
         "providers are tried per lookup, in order: **Nominatim** "
         "(OpenStreetMap, free, no key) first, then **Geoapify** for "
-        "anything Nominatim couldn't resolve."
+        "anything Nominatim couldn't resolve. Progress is saved to disk as "
+        "it runs, so a crash partway through never loses more than a row "
+        "or two of work — reopen this tab and you'll be offered the "
+        "partial result."
     )
 
     df, source_id = pick_dataframe_source("geocode")
@@ -94,6 +99,41 @@ def _guess_column(columns, hints):
     return None
 
 
+def _load_checkpoint(checkpoint_path: Path, as_str: bool) -> Optional[pd.DataFrame]:
+    if not checkpoint_path.exists():
+        return None
+    try:
+        if as_str:
+            return pd.read_csv(checkpoint_path, dtype=str, keep_default_na=False)
+        return pd.read_csv(checkpoint_path)
+    except Exception:  # noqa: BLE001 - corrupt/unreadable checkpoint, treat as absent
+        return None
+
+
+def _checkpoint_banner(checkpoint_df: pd.DataFrame, total_rows: int, checkpoint_path: Path, widget_key: str) -> bool:
+    """Shows a previously-found checkpoint's progress, offers an immediate
+    download, and lets the user choose to resume or start fresh. Returns
+    True if the user chose to resume.
+    """
+    st.info(
+        f"Found a partial run left over from before, covering {len(checkpoint_df):,} "
+        f"of {total_rows:,} rows. You can pick up where it left off, or start over."
+    )
+    st.download_button(
+        "Download partial result as-is",
+        data=checkpoint_df.to_csv(index=False),
+        file_name=checkpoint_path.name,
+        mime="text/csv",
+        key=f"{widget_key}_download_checkpoint",
+    )
+    choice = st.radio(
+        "What do you want to do with it?",
+        ["Resume from here (skip what's already done)", "Start fresh (overwrite it)"],
+        key=f"{widget_key}_resume_choice",
+    )
+    return choice.startswith("Resume")
+
+
 # --- Address -> Coordinates --------------------------------------------------------
 
 
@@ -122,6 +162,15 @@ def _render_forward(df: pd.DataFrame, source_id: str, api_key: Optional[str]) ->
         ),
     ).strip().lower()
 
+    checkpoint_path = logic.checkpoint_path_for(
+        OUTPUTS_DIR, "forward", source_id, primary_col, secondary_col, country_code
+    )
+    resume_from = None
+    checkpoint_df = _load_checkpoint(checkpoint_path, as_str=False)
+    if checkpoint_df is not None:
+        if _checkpoint_banner(checkpoint_df, len(df), checkpoint_path, "geocode_fwd"):
+            resume_from = checkpoint_df
+
     unique_queries = logic.count_unique_queries(df, address_cols)
     est_seconds = unique_queries * logic.NOMINATIM_DELAY
     st.caption(
@@ -131,10 +180,17 @@ def _render_forward(df: pd.DataFrame, source_id: str, api_key: Optional[str]) ->
     )
 
     if st.button("Start geocoding", type="primary", key="geocode_run_forward"):
-        _run_forward(df, address_cols, country_code, api_key)
+        _run_forward(df, address_cols, country_code, api_key, checkpoint_path, resume_from)
 
 
-def _run_forward(df: pd.DataFrame, address_cols: List[str], country_code: str, api_key: Optional[str]) -> None:
+def _run_forward(
+    df: pd.DataFrame,
+    address_cols: List[str],
+    country_code: str,
+    api_key: Optional[str],
+    checkpoint_path: Path,
+    resume_from: Optional[pd.DataFrame],
+) -> None:
     providers = [logic.build_nominatim_fn(country_code=country_code)]
     if api_key:
         providers.append(logic.build_geoapify_fn(api_key))
@@ -147,8 +203,16 @@ def _run_forward(df: pd.DataFrame, address_cols: List[str], country_code: str, a
         progress_bar.progress(done / total if total else 1.0)
         status_text.text(f"Geocoded {done:,} / {total:,} rows...")
 
-    result_df = logic.geocode_dataframe(df, address_cols, geocode_fn, progress_callback=on_progress)
+    result_df = logic.geocode_dataframe(
+        df,
+        address_cols,
+        geocode_fn,
+        progress_callback=on_progress,
+        resume_from=resume_from,
+        checkpoint_path=checkpoint_path,
+    )
     stats = logic.summarise(result_df)
+    checkpoint_path.unlink(missing_ok=True)  # finished cleanly — no partial state to keep around
 
     progress_bar.empty()
     status_text.empty()
@@ -220,26 +284,54 @@ def _render_reverse(df: pd.DataFrame, source_id: str, api_key: Optional[str]) ->
     )
     address_col = None if address_choice.startswith("(none") else address_choice
 
-    unique_coords = logic.count_unique_coords(df, lat_col, lon_col, address_col=address_col)
+    checkpoint_path = logic.checkpoint_path_for(
+        OUTPUTS_DIR, "reverse", source_id, lat_col, lon_col, address_col or ""
+    )
+    run_df = df
+    effective_address_col = address_col
+    checkpoint_df = _load_checkpoint(checkpoint_path, as_str=True)
+    if checkpoint_df is not None:
+        if _checkpoint_banner(checkpoint_df, len(df), checkpoint_path, "geocode_rev"):
+            run_df = checkpoint_df
+            effective_address_col = address_col or "reverse_address"
+
+    unique_coords = logic.count_unique_coords(run_df, lat_col, lon_col, address_col=effective_address_col)
     est_seconds = unique_coords * logic.NOMINATIM_DELAY
-    if address_col:
+    if effective_address_col:
+        rows_missing = (
+            int(logic.missing_value_mask(run_df[effective_address_col]).sum())
+            if effective_address_col in run_df.columns
+            else len(run_df)
+        )
         st.caption(
-            f"{unique_coords:,} row(s) are missing '{address_col}' out of {len(df):,} total "
-            f"(repeats cached) — only those get looked up; roughly {_format_duration(est_seconds)} "
-            "at Nominatim's ~1 lookup/second. Every other row stays exactly as it is."
+            f"{rows_missing:,} row(s) still need '{effective_address_col}' filled in, at "
+            f"{unique_coords:,} unique location(s) (rows sharing coordinates are looked up "
+            f"once) — {unique_coords:,} lookups, roughly {_format_duration(est_seconds)} at "
+            "Nominatim's ~1 lookup/second. Every other row stays exactly as it is."
         )
     else:
+        st.warning(
+            "No existing address column selected, so **every row** will be looked up "
+            "into a new `reverse_address` column, including rows that already have an "
+            "address. If your file already has an address column, pick it in "
+            "'Existing address column' above so only the blank rows get looked up."
+        )
         st.caption(
             f"{unique_coords:,} unique coordinate pair(s) out of {len(df):,} rows (repeats cached) — "
             f"roughly {_format_duration(est_seconds)} at Nominatim's ~1 lookup/second."
         )
 
     if st.button("Start reverse geocoding", type="primary", key="geocode_run_reverse"):
-        _run_reverse(df, lat_col, lon_col, address_col, api_key)
+        _run_reverse(run_df, lat_col, lon_col, effective_address_col, api_key, checkpoint_path)
 
 
 def _run_reverse(
-    df: pd.DataFrame, lat_col: str, lon_col: str, address_col: Optional[str], api_key: Optional[str]
+    df: pd.DataFrame,
+    lat_col: str,
+    lon_col: str,
+    address_col: Optional[str],
+    api_key: Optional[str],
+    checkpoint_path: Path,
 ) -> None:
     providers = [logic.build_nominatim_reverse_fn()]
     if api_key:
@@ -249,14 +341,21 @@ def _run_reverse(
     progress_bar = st.progress(0.0)
     status_text = st.empty()
 
-    def on_progress(done: int, total: int) -> None:
-        progress_bar.progress(done / total if total else 1.0)
-        status_text.text(f"Reverse geocoded {done:,} / {total:,} rows...")
+    def on_lookup(done: int, needed: int) -> None:
+        progress_bar.progress(done / needed if needed else 1.0)
+        status_text.text(f"Lookup {done:,} / {needed:,} (unique locations missing an address)...")
 
     result_df = logic.reverse_geocode_dataframe(
-        df, lat_col, lon_col, reverse_fn, address_col=address_col, progress_callback=on_progress
+        df,
+        lat_col,
+        lon_col,
+        reverse_fn,
+        address_col=address_col,
+        checkpoint_path=checkpoint_path,
+        lookup_callback=on_lookup,
     )
     stats = logic.summarise_reverse(result_df)
+    checkpoint_path.unlink(missing_ok=True)  # finished cleanly — no partial state to keep around
 
     progress_bar.empty()
     status_text.empty()

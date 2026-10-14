@@ -16,10 +16,12 @@ Two directions, each trying the same two providers in order:
 Identical lookups (same address, or same coordinate pair) are only made
 once per run (cached).
 """
+import hashlib
 import re
 import time
 from collections import Counter
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
 import pandas as pd
@@ -41,6 +43,50 @@ GEOAPIFY_URL = GEOAPIFY_SEARCH_URL
 
 PROVIDER_NOMINATIM = "nominatim"
 PROVIDER_GEOAPIFY = "geoapify"
+
+
+CHECKPOINT_INTERVAL_SECONDS = 5.0
+
+
+class _CheckpointWriter:
+    """Writes the in-progress result to disk at most once every
+    `interval` seconds (plus a final flush), so a large file isn't
+    rewritten in full after every single lookup. A crash loses at most
+    the lookups made since the last write.
+    """
+
+    def __init__(self, path: Optional[Path], interval: float = CHECKPOINT_INTERVAL_SECONDS):
+        self.path = path
+        self.interval = interval
+        self._last_write = float("-inf")
+        self._dirty = False
+
+    def mark_dirty(self, df: pd.DataFrame) -> None:
+        if self.path is None:
+            return
+        self._dirty = True
+        if time.monotonic() - self._last_write >= self.interval:
+            self.flush(df)
+
+    def flush(self, df: pd.DataFrame) -> None:
+        if self.path is None or not self._dirty:
+            return
+        try:
+            df.to_csv(self.path, index=False)
+        except OSError:  # best-effort; never let a checkpoint write crash the run
+            return
+        self._last_write = time.monotonic()
+        self._dirty = False
+
+
+def checkpoint_path_for(output_dir: Path, *parts: str) -> Path:
+    """A stable path for a run's checkpoint file, derived from `parts`
+    (e.g. direction, source id, chosen columns) — the same inputs always
+    produce the same path, which is what makes "resume this run" possible:
+    the next run with identical settings finds the same file.
+    """
+    digest = hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
+    return output_dir / f"geocode_checkpoint_{digest}.csv"
 
 
 @dataclass(frozen=True)
@@ -129,12 +175,17 @@ def build_nominatim_fn(
             params = {"q": query, "format": "json", "limit": 1}
             if country_code:
                 params["countrycodes"] = country_code
-            response = requests.get(
-                NOMINATIM_SEARCH_URL, params=params, headers=NOMINATIM_HEADERS, timeout=timeout
-            )
-            response.raise_for_status()
-            results = response.json()
-            time.sleep(delay_seconds)  # usage policy: max 1 req/sec
+            try:
+                response = requests.get(
+                    NOMINATIM_SEARCH_URL, params=params, headers=NOMINATIM_HEADERS, timeout=timeout
+                )
+                response.raise_for_status()
+                results = response.json()
+            finally:
+                # usage policy: max 1 req/sec — applied even on failure/timeout,
+                # so a rough patch doesn't turn into a request storm that gets
+                # the whole run rate-limited or blocked.
+                time.sleep(delay_seconds)
             if results:
                 return GeocodeHit(
                     latitude=float(results[0]["lat"]),
@@ -188,15 +239,20 @@ def build_nominatim_reverse_fn(
     """Nominatim reverse lookup: one coordinate pair -> one address."""
 
     def reverse(lat: float, lon: float) -> Optional[ReverseHit]:
-        response = requests.get(
-            NOMINATIM_REVERSE_URL,
-            params={"lat": lat, "lon": lon, "format": "json"},
-            headers=NOMINATIM_HEADERS,
-            timeout=timeout,
-        )
-        response.raise_for_status()
-        data = response.json()
-        time.sleep(delay_seconds)  # usage policy: max 1 req/sec
+        try:
+            response = requests.get(
+                NOMINATIM_REVERSE_URL,
+                params={"lat": lat, "lon": lon, "format": "json"},
+                headers=NOMINATIM_HEADERS,
+                timeout=timeout,
+            )
+            response.raise_for_status()
+            data = response.json()
+        finally:
+            # usage policy: max 1 req/sec — applied even on failure/timeout,
+            # so a rough patch doesn't turn into a request storm that gets
+            # the whole run rate-limited or blocked.
+            time.sleep(delay_seconds)
         address = data.get("display_name") if isinstance(data, dict) else None
         if not address:
             return None
@@ -273,6 +329,8 @@ def geocode_dataframe(
     address_cols: List[str],
     geocode_fn: GeocodeFn,
     progress_callback: Optional[Callable[[int, int], None]] = None,
+    resume_from: Optional[pd.DataFrame] = None,
+    checkpoint_path: Optional[Path] = None,
 ) -> pd.DataFrame:
     """Add `latitude`, `longitude`, `geocode_status`, `geocode_source` and
     `geocode_query` columns to a copy of `df`.
@@ -280,45 +338,85 @@ def geocode_dataframe(
     `geocode_source` records which provider resolved the row, and
     `geocode_query` which address variant worked — so you can see exactly how
     each coordinate was obtained. Repeated addresses are looked up once.
+
+    `resume_from` is a previous (partial) result for this exact input —
+    typically a checkpoint reloaded after a crash — aligned by row position.
+    Any row already marked `geocode_status == "ok"` there is copied through
+    untouched instead of being looked up again.
+
+    `checkpoint_path`, if given, gets the full in-progress result written to
+    it after real lookups, at most every `CHECKPOINT_INTERVAL_SECONDS`, plus
+    once at the end — a crash partway through loses at most a few seconds of
+    lookups. The next run can pass that same file back in as `resume_from`
+    to continue where it left off.
     """
     result = df.copy()
     queries = build_queries(df, address_cols)
 
-    latitudes: List[Optional[float]] = []
-    longitudes: List[Optional[float]] = []
-    statuses: List[str] = []
-    sources: List[str] = []
-    used_queries: List[str] = []
-    cache: Dict[str, Optional[GeocodeHit]] = {}
+    already_done = None
+    if resume_from is not None and "geocode_status" in resume_from.columns:
+        already_done = (resume_from["geocode_status"].reset_index(drop=True) == "ok").to_numpy()
 
+    for col, default in (
+        ("latitude", None),
+        ("longitude", None),
+        ("geocode_status", ""),
+        ("geocode_source", ""),
+        ("geocode_query", ""),
+    ):
+        result[col] = default
+
+    lat_loc = result.columns.get_loc("latitude")
+    lon_loc = result.columns.get_loc("longitude")
+    status_loc = result.columns.get_loc("geocode_status")
+    source_loc = result.columns.get_loc("geocode_source")
+    query_loc = result.columns.get_loc("geocode_query")
+
+    cache: Dict[str, Optional[GeocodeHit]] = {}
     total = len(result)
+    checkpoint = _CheckpointWriter(checkpoint_path)
+
     for i, address in enumerate(queries, start=1):
-        if not address:
-            hit, status = None, "empty_address"
+        pos = i - 1
+        called_api = False
+
+        if already_done is not None and already_done[pos]:
+            lat_v = resume_from["latitude"].iloc[pos]
+            lon_v = resume_from["longitude"].iloc[pos]
+            status = resume_from["geocode_status"].iloc[pos]
+            source = resume_from["geocode_source"].iloc[pos]
+            query_used = resume_from["geocode_query"].iloc[pos]
+        elif not address:
+            lat_v, lon_v, status, source, query_used = None, None, "empty_address", "", ""
         else:
             if address not in cache:
+                called_api = True
                 try:
                     cache[address] = geocode_fn(address)
                 except Exception:  # noqa: BLE001 - every provider failed
                     cache[address] = None
             hit = cache[address]
+            lat_v = hit.latitude if hit else None
+            lon_v = hit.longitude if hit else None
             status = "ok" if hit else "not_found"
+            source = hit.provider if hit else ""
+            query_used = hit.query_used if hit else ""
 
-        latitudes.append(hit.latitude if hit else None)
-        longitudes.append(hit.longitude if hit else None)
-        statuses.append(status)
-        sources.append(hit.provider if hit else "")
-        used_queries.append(hit.query_used if hit else "")
+        result.iat[pos, lat_loc] = lat_v
+        result.iat[pos, lon_loc] = lon_v
+        result.iat[pos, status_loc] = status
+        result.iat[pos, source_loc] = source
+        result.iat[pos, query_loc] = query_used
 
         if progress_callback:
             progress_callback(i, total)
 
-    result["latitude"] = latitudes
-    result["longitude"] = longitudes
-    result["geocode_status"] = statuses
-    result["geocode_source"] = sources
-    result["geocode_query"] = used_queries
+        # only after a real lookup, and throttled — skipped/cached rows
+        # never trigger a rewrite of the whole file
+        if called_api:
+            checkpoint.mark_dirty(result)
 
+    checkpoint.flush(result)
     return result
 
 
@@ -374,6 +472,8 @@ def reverse_geocode_dataframe(
     reverse_fn: ReverseGeocodeFn,
     address_col: Optional[str] = None,
     progress_callback: Optional[Callable[[int, int], None]] = None,
+    checkpoint_path: Optional[Path] = None,
+    lookup_callback: Optional[Callable[[int, int], None]] = None,
 ) -> pd.DataFrame:
     """Fill in a reverse-geocoded address on a copy of `df`.
 
@@ -388,6 +488,19 @@ def reverse_geocode_dataframe(
     ("existing" / "ok" / "not_found" / "invalid_coords") and
     `reverse_geocode_source` which service resolved it. Repeated coordinate
     pairs (rounded to 6 decimal places) are only looked up once.
+
+    `checkpoint_path`, if given, gets the full in-progress result written
+    to it after real API lookups (never for skipped rows), at most every
+    `CHECKPOINT_INTERVAL_SECONDS`, plus once at the end — a crash partway
+    through loses at most a few seconds of lookups. To resume,
+    pass the reloaded checkpoint back in as `df` with the same
+    `address_col` (its already-filled rows are then skipped like any other
+    pre-existing value).
+
+    `progress_callback(row, total_rows)` fires for every row;
+    `lookup_callback(done, needed)` fires only for rows that actually need
+    a lookup, counting against just those — the number a user cares about
+    when most rows are skipped.
     """
     result = df.copy()
     lat, lon = _numeric_coords(df, lat_col, lon_col)
@@ -396,22 +509,36 @@ def reverse_geocode_dataframe(
     output_col = address_col if fill_in_place else "reverse_address"
     needs_lookup = missing_value_mask(df[address_col]) if fill_in_place else pd.Series(True, index=df.index)
     existing = df[address_col] if fill_in_place else None
+    # unique coordinate pairs = actual API calls (duplicates hit the cache);
+    # same number `count_unique_coords` reports before the run starts
+    lookups_needed = count_unique_coords(df, lat_col, lon_col, address_col=address_col if fill_in_place else None)
+    lookups_done = 0
 
-    addresses: List[str] = []
-    statuses: List[str] = []
-    sources: List[str] = []
+    if output_col not in result.columns:
+        result[output_col] = ""
+    result["reverse_geocode_status"] = ""
+    result["reverse_geocode_source"] = ""
+
+    output_loc = result.columns.get_loc(output_col)
+    status_loc = result.columns.get_loc("reverse_geocode_status")
+    source_loc = result.columns.get_loc("reverse_geocode_source")
+
     cache: Dict[Tuple[float, float], Optional[ReverseHit]] = {}
-
     total = len(result)
+    checkpoint = _CheckpointWriter(checkpoint_path)
+
     for i, (la, lo, need) in enumerate(zip(lat, lon, needs_lookup), start=1):
+        pos = i - 1
         hit = None
+        called_api = False
         if not need:
-            address, status = str(existing.iloc[i - 1]), "existing"
+            address, status = str(existing.iloc[pos]), "existing"
         elif pd.isna(la) or pd.isna(lo):
             address, status = "", "invalid_coords"
         else:
             key = (round(float(la), 6), round(float(lo), 6))
             if key not in cache:
+                called_api = True
                 try:
                     cache[key] = reverse_fn(*key)
                 except Exception:  # noqa: BLE001 - every provider failed
@@ -420,17 +547,22 @@ def reverse_geocode_dataframe(
             address = hit.address if hit else ""
             status = "ok" if hit else "not_found"
 
-        addresses.append(address)
-        statuses.append(status)
-        sources.append(hit.provider if hit else "")
+        result.iat[pos, output_loc] = address
+        result.iat[pos, status_loc] = status
+        result.iat[pos, source_loc] = hit.provider if hit else ""
 
         if progress_callback:
             progress_callback(i, total)
 
-    result[output_col] = addresses
-    result["reverse_geocode_status"] = statuses
-    result["reverse_geocode_source"] = sources
+        if called_api:
+            lookups_done += 1
+            if lookup_callback:
+                lookup_callback(lookups_done, lookups_needed)
 
+        if called_api:
+            checkpoint.mark_dirty(result)
+
+    checkpoint.flush(result)
     return result
 
 

@@ -176,6 +176,15 @@ it never gets committed), or paste one into the tab's password field for
 the session. Without a key the tab still runs Nominatim-only; unresolved
 rows just come back as `not_found`.
 
+**Crash resilience:** on a large file, a run can take a while (Nominatim is
+capped at ~1 lookup/second), so the in-progress result is written to
+`data/outputs/geocode_checkpoint_*.csv` after *every row* — a crash, dropped
+connection, or closed tab never loses more than one row's worth of work.
+Reopen the tab with the same file/columns and you're offered that partial
+result: download it as-is, or **resume** (only the rows not yet done get
+looked up — the ones already resolved are never retried). The checkpoint is
+deleted automatically once a run finishes cleanly.
+
 ## Tab 6: CSV to Excel
 
 Upload a `.csv` file and download it back as an `.xlsx` file — pure format

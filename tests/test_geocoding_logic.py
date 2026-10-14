@@ -467,3 +467,123 @@ def test_reverse_geocode_dataframe_skips_api_entirely_when_nothing_is_blank():
 
     assert list(result["Address"]) == ["A", "B"]
     assert list(result["reverse_geocode_status"]) == ["existing", "existing"]
+
+
+# --- checkpointing & resume --------------------------------------------------------
+
+
+def test_checkpoint_path_for_is_stable_for_same_inputs():
+    from pathlib import Path
+
+    p1 = logic.checkpoint_path_for(Path("/tmp/out"), "reverse", "abc123", "lat", "lon", "Address")
+    p2 = logic.checkpoint_path_for(Path("/tmp/out"), "reverse", "abc123", "lat", "lon", "Address")
+    assert p1 == p2
+
+
+def test_checkpoint_path_for_differs_for_different_inputs():
+    from pathlib import Path
+
+    p1 = logic.checkpoint_path_for(Path("/tmp/out"), "reverse", "abc123", "lat", "lon", "Address")
+    p2 = logic.checkpoint_path_for(Path("/tmp/out"), "reverse", "xyz999", "lat", "lon", "Address")
+    assert p1 != p2
+
+
+def test_reverse_geocode_dataframe_writes_checkpoint_after_every_row(tmp_path):
+    df = pd.DataFrame({"Address": ["", "", ""], "lat": ["1.0", "2.0", "3.0"], "lon": ["1.0", "2.0", "3.0"]})
+    checkpoint_path = tmp_path / "checkpoint.csv"
+    seen_row_counts = []
+
+    def reverse_fn(lat, lon):
+        # at the moment each lookup happens, the checkpoint from the
+        # *previous* row should already be on disk
+        if checkpoint_path.exists():
+            seen_row_counts.append(len(pd.read_csv(checkpoint_path)))
+        return _reverse_hit(f"addr {lat}", logic.PROVIDER_NOMINATIM)
+
+    logic.reverse_geocode_dataframe(
+        df, "lat", "lon", reverse_fn, address_col="Address", checkpoint_path=checkpoint_path
+    )
+
+    assert checkpoint_path.exists()
+    final = pd.read_csv(checkpoint_path)
+    assert len(final) == 3
+    assert list(final["Address"]) == ["addr 1.0", "addr 2.0", "addr 3.0"]
+
+
+def test_reverse_geocode_dataframe_checkpoint_survives_simulated_crash_partway(tmp_path):
+    df = pd.DataFrame(
+        {"Address": ["", "", "", ""], "lat": ["1.0", "2.0", "3.0", "4.0"], "lon": ["1.0", "2.0", "3.0", "4.0"]}
+    )
+    checkpoint_path = tmp_path / "checkpoint.csv"
+    calls = []
+
+    def flaky_reverse_fn(lat, lon):
+        calls.append((lat, lon))
+        if len(calls) == 3:
+            raise RuntimeError("simulated crash on the 3rd row")
+        return _reverse_hit(f"addr {lat}", logic.PROVIDER_NOMINATIM)
+
+    # row 3 "fails" (returns None, since the exception is caught inside the
+    # function) but the checkpoint must still have rows 1-2 resolved and be
+    # readable at every point — simulating "stopped after some progress"
+    logic.reverse_geocode_dataframe(
+        df, "lat", "lon", flaky_reverse_fn, address_col="Address", checkpoint_path=checkpoint_path
+    )
+    checkpoint = pd.read_csv(checkpoint_path)
+    assert list(checkpoint["Address"].fillna("")) == ["addr 1.0", "addr 2.0", "", "addr 4.0"]
+
+
+def test_resume_via_address_col_skips_rows_already_in_checkpoint():
+    # simulates: first run resolved rows 0-1, "crashed", user reruns with
+    # the checkpoint file as the new input
+    checkpoint_df = pd.DataFrame(
+        {
+            "Address": ["Resolved A", "Resolved B", "", ""],
+            "lat": ["1.0", "2.0", "3.0", "4.0"],
+            "lon": ["1.0", "2.0", "3.0", "4.0"],
+        }
+    )
+    calls = []
+
+    def reverse_fn(lat, lon):
+        calls.append((lat, lon))
+        return _reverse_hit(f"addr {lat}", logic.PROVIDER_NOMINATIM)
+
+    result = logic.reverse_geocode_dataframe(checkpoint_df, "lat", "lon", reverse_fn, address_col="Address")
+
+    # only the 2 still-blank rows triggered a lookup
+    assert calls == [(3.0, 3.0), (4.0, 4.0)]
+    assert list(result["Address"]) == ["Resolved A", "Resolved B", "addr 3.0", "addr 4.0"]
+    assert list(result["reverse_geocode_status"]) == ["existing", "existing", "ok", "ok"]
+
+
+def test_geocode_dataframe_writes_checkpoint_and_supports_resume(tmp_path):
+    df = pd.DataFrame({"address": ["a", "b", "c"]})
+    checkpoint_path = tmp_path / "checkpoint.csv"
+    calls = []
+
+    def geocode_fn(address):
+        calls.append(address)
+        if address == "b":
+            return None  # "b" fails on the first attempt
+        return logic.GeocodeHit(latitude=1.0, longitude=2.0, provider=logic.PROVIDER_NOMINATIM, query_used=address)
+
+    first = logic.geocode_dataframe(df, ["address"], geocode_fn, checkpoint_path=checkpoint_path)
+    assert list(first["geocode_status"]) == ["ok", "not_found", "ok"]
+    assert checkpoint_path.exists()
+
+    # resume: "b" should be retried since it wasn't "ok"; "a" and "c" should not be
+    calls.clear()
+    resumed_checkpoint = pd.read_csv(checkpoint_path)
+
+    def geocode_fn_v2(address):
+        calls.append(address)
+        return logic.GeocodeHit(latitude=9.0, longitude=9.0, provider=logic.PROVIDER_GEOAPIFY, query_used=address)
+
+    second = logic.geocode_dataframe(df, ["address"], geocode_fn_v2, resume_from=resumed_checkpoint)
+
+    assert calls == ["b"]  # only the previously-failed row was retried
+    assert list(second["geocode_status"]) == ["ok", "ok", "ok"]
+    assert second["geocode_source"].iloc[0] == logic.PROVIDER_NOMINATIM  # untouched from first run
+    assert second["geocode_source"].iloc[1] == logic.PROVIDER_GEOAPIFY    # newly resolved on resume
+    assert second["geocode_source"].iloc[2] == logic.PROVIDER_NOMINATIM  # untouched from first run
